@@ -10,4 +10,6 @@ src
 node_modules
 
 # TypeScript config file (not needed by the end-user)
-tsconfig.json
+tsconfig.cjs.json
+tsconfig.esm.json
+examples/test-priority.html

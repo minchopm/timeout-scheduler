@@ -1,12 +1,27 @@
 {
   "name": "@artesoft/timeout-scheduler",
-  "version": "1.2.0",
-  "description": "A performance-oriented, freeze-proof timeout scheduler that uses requestAnimationFrame to prevent UI blocking.",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "version": "1.3.1",
+  "description": "A performance-oriented, freeze-proof scheduler that provides a priority-based task system to prevent UI blocking.",
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/esm/index.d.ts",
   "scripts": {
-    "build": "tsc"
+    "clean": "rm -rf dist",
+    "build": "npm run clean && tsc -p tsconfig.esm.json && tsc -p tsconfig.cjs.json",
+    "prepublishOnly": "npm run build"
   },
+  "exports": {
+    ".": {
+      "types": "./dist/esm/index.d.ts",
+      "import": "./dist/esm/index.js",
+      "require": "./dist/cjs/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/minchopm/timeout-scheduler.git"
@@ -15,10 +30,16 @@
     "setTimeout",
     "performance",
     "scheduler",
+    "requestAnimationFrame",
+    "requestIdleCallback",
+    "priority",
+    "cooperative",
+    "freeze-proof",
+    "adaptive",
+    "dynamic",
     "angular",
     "react",
-    "vue",
-    "requestAnimationFrame"
+    "vue"
   ],
   "author": {
     "name": "Artesoft Inc.",
@@ -32,7 +53,7 @@
     }
   ],
   "bugs": {
-    "url": "https://github.com/minchompm/timeout-scheduler/issues"
+    "url": "https://github.com/minchopm/timeout-scheduler/issues"
   },
   "homepage": "https://github.com/minchopm/timeout-scheduler#readme",
   "dependencies": {

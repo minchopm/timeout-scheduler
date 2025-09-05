@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>TimeoutScheduler Priority Test</title>
+    <style>
+        body { font-family: sans-serif; padding: 1em; line-height: 1.6; background: #f4f4f9; }
+        button { font-size: 1rem; padding: 0.5em 1em; margin-right: 0.5em; border-radius: 5px; cursor: pointer; border: 1px solid #ccc; }
+        #log-output { margin-top: 1em; padding: 1em; background: #fff; border: 1px solid #ddd; height: 400px; overflow-y: scroll; font-family: monospace; font-size: 0.9rem; }
+        .log-visible { color: #0056b3; }
+        .log-background { color: #5cb85c; }
+    </style>
+</head>
+<body>
+<h1>TimeoutScheduler Priority Test</h1>
+<p>Open the developer console to see the scheduler switching tickers.</p>
+<button id="mixed-load-btn">Run Mixed Load Test</button>
+<button id="add-high-prio-btn" disabled>Add High-Prio Task During Idle</button>
+
+<div id="log-output"></div>
+
+<!--
+  ============================================================================
+  THE FIX: POINT TO A BUNDLED ES MODULE
+  The new URL points to a single file from esm.sh that contains all the
+  necessary RxJS code, preventing the cascade of 404 errors.
+  ============================================================================
+-->
+<script type="importmap">
+    {
+      "imports": {
+        "rxjs": "https://esm.sh/rxjs@7.8.1"
+      }
+    }
+</script>
+
+<script type="module">
+    // --- Import the TimeoutScheduler class from the compiled output ---
+    // This now works perfectly.
+    import { TimeoutScheduler } from '../dist/esm/index.js';
+
+    // --- Test Logic ---
+    const logOutput = document.getElementById('log-output');
+    const addHighPrioBtn = document.getElementById('add-high-prio-btn');
+    let idleSwitchDetected = false;
+
+    function logMessage(message, type = 'visible') {
+        const el = document.createElement('div');
+        el.textContent = `[${performance.now().toFixed(0)}ms] ${message}`;
+        el.className = type === 'background' ? 'log-background' : 'log-visible';
+        logOutput.appendChild(el);
+        logOutput.scrollTop = logOutput.scrollHeight;
+    }
+
+    // Hijack console.log to detect when the scheduler switches to rIC
+    const originalLog = console.log;
+    console.log = function(message) {
+        originalLog.apply(console, arguments);
+        if (typeof message === 'string' && message.includes('Switching to idle callback mode')) {
+            idleSwitchDetected = true;
+            addHighPrioBtn.disabled = false;
+        }
+    };
+
+    const scheduler = new TimeoutScheduler({ loggingEnabled: true });
+
+    document.getElementById('mixed-load-btn').addEventListener('click', () => {
+        logOutput.innerHTML = '';
+        idleSwitchDetected = false;
+        addHighPrioBtn.disabled = true;
+
+        logMessage("--- Scheduling 5 high-priority tasks ---");
+        for (let i = 1; i <= 5; i++) {
+            scheduler.scheduleTask(() => logMessage(`Executing USER-VISIBLE task #${i}`), {
+                delay: i * 50,
+                priority: 'user-visible'
+            });
+        }
+
+        logMessage("--- Scheduling 20 low-priority tasks ---");
+        for (let i = 1; i <= 20; i++) {
+            scheduler.scheduleTask(() => logMessage(`Executing BACKGROUND task #${i}`, 'background'), {
+                delay: 300 + i * 50,
+                priority: 'background'
+            });
+        }
+    });
+
+    addHighPrioBtn.addEventListener('click', () => {
+        logMessage("--- ADDING URGENT TASK! Scheduler should switch back to rAF. ---");
+        scheduler.scheduleTask(() => logMessage(`EXECUTED URGENT TASK!`), {
+            priority: 'user-visible'
+        });
+        addHighPrioBtn.disabled = true;
+    });
+
+</script>
+</body>
+</html>

@@ -3,25 +3,31 @@
 [![NPM Version](https://img.shields.io/npm/v/@artesoft/timeout-scheduler.svg)](https://www.npmjs.com/package/@artesoft/timeout-scheduler)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A performance-oriented, "freeze-proof" `setTimeout` scheduler that prevents UI blocking by processing tasks within the browser's animation frames.
+A performance-oriented, "freeze-proof" scheduler that provides a priority-based task system to prevent UI blocking. It intelligently uses `requestAnimationFrame` for high-priority tasks and `requestIdleCallback` for non-essential background work.
 
 ---
 
 ### The Problem
 
-In complex web applications, especially in frameworks like Angular, React, or Vue, you might have hundreds or thousands of `setTimeout` calls firing in a short period. This can happen during data processing, rendering large lists, or third-party script execution. When too many callbacks execute at once, they can block the browser's main thread, leading to a frozen UI, janky animations, and a poor user experience.
+Complex web applications can fire hundreds of `setTimeout` calls, blocking the browser's main thread and leading to a frozen UI, janky animations, and a poor user experience. Not all tasks are equally important, but the browser treats them the same, executing a non-critical analytics event with the same urgency as a UI update.
 
 ### The Solution
 
-`@artesoft/timeout-scheduler` solves this by intercepting calls to `setTimeout` and `clearTimeout`. Instead of letting them fire immediately when their time is up, it adds them to a queue. This queue is then processed smoothly using `requestAnimationFrame`, executing a limited number of tasks per frame. This ensures that the main thread is never blocked for too long, keeping your application responsive at all times.
+`@artesoft/timeout-scheduler` solves this by intercepting `setTimeout` and providing a priority-aware task queue.
+
+-   **High-priority tasks** (e.g., UI updates) are processed smoothly using `requestAnimationFrame`, ensuring your application remains responsive.
+-   **Low-priority tasks** (e.g., logging, non-essential data processing) are deferred to `requestIdleCallback`, allowing the browser to execute them during periods of inactivity, guaranteeing zero impact on performance.
 
 ## Features
 
-- **Prevents UI Freezing:** Batches `setTimeout` callbacks to run smoothly over time.
-- **Graceful Shutdown:** Pending tasks are never lost; they are automatically rescheduled with the native `setTimeout` on cleanup.
-- **Drop-in Replacement:** Works by overriding the global functions. No need to refactor your existing code.
-- **Configurable:** Adjust the number of tasks processed per frame and enable/disable logging.
-- **Framework-Agnostic:** Works with any frontend framework or vanilla JavaScript.
+-   **Prevents UI Freezing:** Batches `setTimeout` callbacks to run smoothly over time.
+-   **🚀 Cooperative Scheduling:** Uses `requestIdleCallback` for low-priority tasks to run work only when the browser is idle.
+-   **Task Prioritization:** A new `scheduleTask` API lets you distinguish between `'user-visible'` and `'background'` work.
+-   **Dynamic Performance Tuning:** Automatically adjusts how many tasks run per frame based on main thread performance.
+-   **Drop-in Replacement:** The `overrideTimeouts()` method works without refactoring your existing `setTimeout` calls.
+-   **Graceful Shutdown:** Pending tasks are never lost and are rescheduled with native `setTimeout` on cleanup.
+-   **Highly Configurable:** Fine-tune the scheduling behavior, enable dynamic budgeting, and turn on logging.
+-   **Framework-Agnostic:** Works with any frontend framework or vanilla JavaScript.
 
 ## Installation
 
@@ -31,61 +37,39 @@ npm install @artesoft/timeout-scheduler rxjs
 
 ## How to Use
 
-### Basic Usage
+### Basic Usage (Drop-in)
 
-Initialize the scheduler at the entry point of your application (e.g., `main.ts` in Angular, `index.js` in React).
-
-```typescript
-import { TimeoutScheduler } from '@artesoft/timeout-scheduler';
-
-// 1. Create an instance of the scheduler
-const scheduler = new TimeoutScheduler();
-
-// 2. Override the global timeout functions
-scheduler.overrideTimeouts();
-
-// Now, all subsequent calls to setTimeout in your application
-// will be managed by the scheduler.
-setTimeout(() => {
-  console.log('This will be executed without freezing the UI!');
-}, 100);
-
-// Later, when you need to clean up, your pending timeouts won't be lost!
-// scheduler.restoreTimeouts();
-```
-
-### Advanced Configuration
-
-You can configure the scheduler during initialization.
+For instant benefits, simply initialize the scheduler and override the global `setTimeout`. All existing calls will be treated as high-priority and managed smoothly.
 
 ```typescript
 import { TimeoutScheduler } from '@artesoft/timeout-scheduler';
 
-const scheduler = new TimeoutScheduler({
-  // The maximum number of tasks to execute per frame (Default: 75)
-  tasksPerFrameBudget: 100,
-
-  // Enable console warnings for debugging (Default: false)
-  loggingEnabled: true 
-});
-
+const scheduler = new TimeoutScheduler({ loggingEnabled: true });
 scheduler.overrideTimeouts();
-```
 
-### Graceful Shutdown: No Task is Left Behind
+// This is now managed by the scheduler and won't block the UI.
+setTimeout(() => console.log('This is a user-visible task!'), 100);```
 
-A key feature of this library is its robust cleanup process. When you call `restoreTimeouts()` or `destroy()`, the scheduler doesn't simply discard the tasks waiting in its queue.
+### Advanced Usage with Task Priorities
 
-Instead, it intelligently hands them off to the browser's native `setTimeout` function. It calculates the remaining time for each pending task and reschedules it to run. This guarantees that your application behaves predictably and no callbacks are ever lost, even when a component is destroyed or the application state changes.
-
-### Monitoring Pending Tasks
-
-You can subscribe to the `pendingTaskCount$` observable to monitor how many tasks are waiting in the queue.
+Use the `scheduleTask` method to leverage the full power of cooperative scheduling.
 
 ```typescript
-scheduler.pendingTaskCount$.subscribe(count => {
-  console.log(`Tasks remaining in the queue: ${count}`);
-});
+import { TimeoutScheduler } from '@artesoft/timeout-scheduler';
+
+const scheduler = new TimeoutScheduler({ loggingEnabled: true });
+
+// High-priority task: Renders an important UI element.
+// Will use requestAnimationFrame.
+scheduler.scheduleTask(() => {
+  document.getElementById('root').innerHTML = 'UI Updated!';
+}, { delay: 100, priority: 'user-visible' });
+
+// Low-priority task: Send analytics data.
+// Will use requestIdleCallback and only run when the browser is idle.
+scheduler.scheduleTask(() => {
+  fetch('/api/analytics', { method: 'POST', body: '{}' });
+}, { delay: 500, priority: 'background' });
 ```
 
 ---
@@ -96,9 +80,9 @@ This library was built by the team behind **[Cloud Calendars](https://cloud-cale
 
 If you're tired of juggling multiple calendars, you'll love our app. **Cloud Calendars** is a powerful calendar management tool that's better than the default iOS app. It seamlessly integrates Google Calendar, Microsoft Teams, and more into a single, intuitive interface.
 
-- **Unify All Your Calendars:** Manage all your schedules in one place.
-- **Effortless Scheduling:** Drag, drop, and resize events across different calendars instantly.
-- **Plan with Confidence:** See hourly weather forecasts directly in your daily view to perfectly plan your day.
+-   **Unify All Your Calendars:** Manage all your schedules in one place.
+-   **Effortless Scheduling:** Drag, drop, and resize events across different calendars instantly.
+-   **Plan with Confidence:** See hourly weather forecasts directly in your daily view to perfectly plan your day.
 
 Give your productivity a boost and take control of your schedule. **[Check out Cloud Calendars today!](https://cloud-calendars.com)**
 
@@ -107,21 +91,38 @@ Give your productivity a boost and take control of your schedule. **[Check out C
 ## API Reference
 
 ### `new TimeoutScheduler(config?)`
+
 Creates a new scheduler instance.
 - `config` (optional): `SchedulerConfig` object.
-    - `tasksPerFrameBudget?: number` (Default: `75`)
-    - `loggingEnabled?: boolean` (Default: `false`)
+  - `initialTasksPerFrame?: number` (Default: `50`)
+  - `loggingEnabled?: boolean` (Default: `false`)
+  - `runInBackground?: boolean` (Default: `false`)
+  - `dynamicBudgetEnabled?: boolean` (Default: `true`)
+  - `frameTimeBudgetMs?: number` (Default: `8`)
+  - `maxTasksPerFrame?: number` (Default: `150`)
+
+### `.scheduleTask(callback, options?)`
+
+Schedules a task with a given priority. This is the preferred API for new code.
+- `callback: (...args: any[]) => void`
+- `options?: TaskOptions`
+  - `delay?: number` (Default: `0`)
+  - `priority?: 'user-visible' | 'background'` (Default: `'user-visible'`)
 
 ### `.overrideTimeouts()`
-Replaces `window.setTimeout` and `window.clearTimeout` with the scheduler's implementation.
+
+Replaces `window.setTimeout` and `window.clearTimeout`. All tasks scheduled via this method are assigned `'user-visible'` priority.
 
 ### `.restoreTimeouts()`
-Restores the original `window.setTimeout` and `window.clearTimeout` functions. **Crucially, it gracefully reschedules any pending tasks using the native `setTimeout`** to ensure no callbacks are lost.
+
+Restores the original `window.setTimeout` and `window.clearTimeout` functions and reschedules any pending tasks.
 
 ### `.destroy()`
-A complete cleanup method. It calls `restoreTimeouts()` to reschedule pending tasks and then completes the `pendingTaskCount$` observable to prevent memory leaks.
+
+A complete cleanup method. It calls `restoreTimeouts()` and completes observables to prevent memory leaks.
 
 ### `pendingTaskCount$`
+
 An RxJS `Observable<number>` that emits the current number of tasks in the queue.
 
 ## License

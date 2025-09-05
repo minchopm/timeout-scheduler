@@ -1,99 +1,173 @@
 import { BehaviorSubject, Observable } from 'rxjs';
 
 /**
+ * Defines the priority of a task, determining when it should be executed.
+ * - `user-visible`: High priority. The task is important for the user experience and
+ *   should run as soon as possible. Uses `requestAnimationFrame`.
+ * - `background`: Low priority. The task is non-essential and can be deferred until
+ *   the browser is idle. Uses `requestIdleCallback`.
+ */
+export type TaskPriority = 'user-visible' | 'background';
+
+/**
+ * Defines the options for scheduling a task with priority.
+ */
+export interface TaskOptions {
+    /** The delay in milliseconds before the task should be executed. */
+    delay?: number;
+    /** The priority of the task, affecting which scheduling mechanism is used. */
+    priority?: TaskPriority;
+}
+
+/**
  * Defines the configuration options for the TimeoutScheduler.
  */
 export interface SchedulerConfig {
     /**
-     * The maximum number of tasks to execute per animation frame. This budget
-     * prevents the main thread from blocking and keeps the UI responsive.
-     * @default 75
+     * The initial number of tasks to execute per frame. This value will be
+     * dynamically adjusted if `dynamicBudgetEnabled` is true.
+     * @default 50
      */
-    tasksPerFrameBudget?: number;
-
+    initialTasksPerFrame?: number;
     /**
-     * If true, the scheduler will log its status to the console. This includes
-     * overriding/restoring timeouts and switching between ticker mechanisms.
+     * If true, the scheduler will log its status and budget adjustments to the console.
      * @default false
      */
     loggingEnabled?: boolean;
-
     /**
-     * If true, the scheduler will switch to a 'setInterval' based ticker
-     * when the tab is in the background. This ensures tasks continue to run,
-     * even when the page is not visible.
+     * If true, the scheduler will switch to a `setInterval` ticker when the page is
+     * hidden to ensure tasks continue to execute in the background.
      * @default false
      */
     runInBackground?: boolean;
+    /**
+     * If true, enables the dynamic adjustment of the tasks-per-frame budget
+     * based on the main thread's performance.
+     * @default true
+     */
+    dynamicBudgetEnabled?: boolean;
+    /**
+     * The target frame processing time in milliseconds. If a frame's work exceeds
+     * this budget, the scheduler will reduce its workload for subsequent frames.
+     * @default 8
+     */
+    frameTimeBudgetMs?: number;
+    /**
+     * The maximum number of tasks the scheduler is allowed to execute in a
+     * single frame, preventing the dynamic budget from growing indefinitely.
+     * @default 150
+     */
+    maxTasksPerFrame?: number;
 }
 
 /**
- * @internal
- * The interval (in ms) for the less frequent background ticker.
+ * @internal The interval (in ms) for the less frequent background ticker.
  */
-const BACKGROUND_TICK_INTERVAL_MS = 250; // Ticks 4 times per second.
+const BACKGROUND_TICK_INTERVAL_MS = 250;
 
 /**
- * @internal
- * An internal interface representing a task scheduled to be executed.
+ * @internal An internal interface representing a task in the queue.
  */
 interface ScheduledTask {
     id: number;
     callback: (...args: any[]) => void;
     executeAt: number;
     args: any[];
+    priority: TaskPriority;
 }
 
 /**
- * A performance-oriented scheduler that overrides `setTimeout` to prevent UI
- * blocking. It uses `requestAnimationFrame` for smooth performance when the tab
- * is visible, and can intelligently switch to `setInterval` to ensure task
- * execution when the tab is in the background.
+ * A performance-oriented scheduler that overrides `setTimeout` and provides a
+ * priority-based task scheduling system. It uses `requestAnimationFrame` for
+ * high-priority work and `requestIdleCallback` for background tasks to ensure
+ * a smooth user experience.
  */
 export class TimeoutScheduler {
-    // --- Private Properties ---
-
-    private readonly tasksPerFrameBudget: number;
+    // --- Configuration ---
     private readonly loggingEnabled: boolean;
     private readonly runInBackground: boolean;
+    private readonly dynamicBudgetEnabled: boolean;
+    private readonly frameTimeBudgetMs: number;
+    private readonly maxTasksPerFrame: number;
+    private readonly initialTasksPerFrame: number;
 
-    private readonly originalSetTimeout: (handler: (...args: any[]) => void, timeout?: number, ...args: any[]) => number = window.setTimeout;
+    // --- Native Functions ---
+    private readonly originalSetTimeout = window.setTimeout;
     private readonly originalClearTimeout = window.clearTimeout;
 
+    // --- State ---
     private isOverridden = false;
-    private isTicking = false;
     private taskIdCounter = 0;
-    private animationFrameId = 0;
-    private backgroundTickerId: number | null = null;
-
+    private currentTasksPerFrame: number;
     private taskQueue = new Map<number, ScheduledTask>();
 
-    // --- Public Properties ---
+    // --- Ticker Management ---
+    private animationFrameId = 0;
+    private backgroundTickerId: number | null = null;
+    private idleCallbackId = 0;
+    private activeTicker: 'rAF' | 'rIC' | 'interval' | 'none' = 'none';
 
+    // --- Public Observables ---
+
+    /** An RxJS Observable that emits the current number of tasks pending in the queue. */
+    public readonly pendingTaskCount$: Observable<number>;
     private readonly pendingTaskCountSubject = new BehaviorSubject<number>(0);
-    public readonly pendingTaskCount$: Observable<number> = this.pendingTaskCountSubject.asObservable();
 
     /**
      * Constructs an instance of the TimeoutScheduler.
      * @param config Optional configuration to customize the scheduler's behavior.
      */
     constructor(config?: SchedulerConfig) {
-        this.tasksPerFrameBudget = config?.tasksPerFrameBudget ?? 75;
+        this.pendingTaskCount$ = this.pendingTaskCountSubject.asObservable();
+
         this.loggingEnabled = config?.loggingEnabled ?? false;
         this.runInBackground = config?.runInBackground ?? false;
+        this.dynamicBudgetEnabled = config?.dynamicBudgetEnabled ?? true;
+        this.frameTimeBudgetMs = config?.frameTimeBudgetMs ?? 8;
+        this.initialTasksPerFrame = config?.initialTasksPerFrame ?? 50;
+        this.maxTasksPerFrame = config?.maxTasksPerFrame ?? 150;
+        this.currentTasksPerFrame = this.initialTasksPerFrame;
 
-        if (typeof window === 'undefined' || typeof window.requestAnimationFrame === 'undefined') {
-            throw new Error('TimeoutScheduler can only run in a browser environment with requestAnimationFrame support.');
+        if (typeof window === 'undefined' || !window.requestAnimationFrame || !window.performance) {
+            throw new Error('TimeoutScheduler requires a browser environment with requestAnimationFrame and performance API support.');
         }
 
-        // If configured to run in the background, listen for page visibility changes.
         if (this.runInBackground && typeof document !== 'undefined') {
             document.addEventListener('visibilitychange', this.handleVisibilityChange);
         }
     }
 
     /**
+     * Schedules a task with a specific priority. This is the recommended way to
+     * leverage the scheduler's cooperative scheduling capabilities.
+     * @param callback The function to execute.
+     * @param options The scheduling options, including delay and priority.
+     * @returns The ID of the scheduled task, which can be used for cancellation.
+     */
+    public scheduleTask(callback: (...args: any[]) => void, options?: TaskOptions): number {
+        const taskId = ++this.taskIdCounter;
+        const priority = options?.priority ?? 'user-visible';
+        const executeAt = performance.now() + (options?.delay ?? 0);
+
+        this.taskQueue.set(taskId, { id: taskId, callback, executeAt, args: [], priority });
+        this.pendingTaskCountSubject.next(this.taskQueue.size);
+
+        if (this.activeTicker === 'none') {
+            this.startTicker();
+        } else if (priority === 'user-visible' && this.activeTicker === 'rIC') {
+            if (this.loggingEnabled) {
+                console.warn('--- TimeoutScheduler: High priority task added. Switching from rIC to rAF. ---');
+            }
+            this.stopTicker();
+            this.startTicker();
+        }
+
+        return taskId;
+    }
+
+    /**
      * Overrides the global `window.setTimeout` and `window.clearTimeout` functions.
+     * All tasks scheduled via the global `setTimeout` will be treated as 'user-visible' priority.
      */
     public overrideTimeouts(): void {
         if (this.isOverridden) { return; }
@@ -103,15 +177,7 @@ export class TimeoutScheduler {
         this.isOverridden = true;
 
         window.setTimeout = ((callback: (...args: any[]) => void, delay?: number, ...args: any[]): number => {
-            const taskId = ++this.taskIdCounter;
-            const executeAt = Date.now() + (delay || 0);
-            this.taskQueue.set(taskId, { id: taskId, callback, executeAt, args });
-            this.pendingTaskCountSubject.next(this.taskQueue.size);
-
-            if (!this.isTicking) {
-                this.startTicker();
-            }
-            return taskId;
+            return this.scheduleTask(callback.bind(null, ...args), { delay, priority: 'user-visible' });
         }) as any;
 
         window.clearTimeout = ((timeoutId?: number): void => {
@@ -119,6 +185,7 @@ export class TimeoutScheduler {
             if (this.taskQueue.delete(timeoutId)) {
                 this.pendingTaskCountSubject.next(this.taskQueue.size);
             } else {
+                // Also attempt to clear a native timeout in case it was scheduled before override.
                 this.originalClearTimeout.apply(window, [timeoutId]);
             }
         }) as any;
@@ -126,105 +193,187 @@ export class TimeoutScheduler {
 
     /**
      * Restores the original `window.setTimeout` and `window.clearTimeout` functions.
-     * It gracefully reschedules any pending tasks using the native `setTimeout`.
+     * It gracefully reschedules any pending tasks using the native `setTimeout` to
+     * ensure no callbacks are lost.
      */
     public restoreTimeouts(): void {
         if (!this.isOverridden) { return; }
+        this.stopTicker();
         if (this.loggingEnabled) {
             console.warn('--- TimeoutScheduler: Restoring original functions and rescheduling pending tasks. ---');
         }
-        this.stopTicker();
-
         window.setTimeout = this.originalSetTimeout as any;
         window.clearTimeout = this.originalClearTimeout;
         this.isOverridden = false;
 
-        const now = Date.now();
+        const now = performance.now();
         for (const task of this.taskQueue.values()) {
             const remainingDelay = Math.max(0, task.executeAt - now);
-            this.originalSetTimeout.apply(window, [task.callback, remainingDelay, ...task.args]);
+            this.originalSetTimeout(task.callback, remainingDelay, ...task.args);
         }
-
         this.taskQueue.clear();
         this.pendingTaskCountSubject.next(0);
     }
 
     /**
-     * Starts the appropriate ticker based on page visibility and configuration.
+     * @internal Chooses and starts the most appropriate ticker based on the current
+     * state of the task queue and page visibility.
      */
     private startTicker(): void {
-        if (this.isTicking) { return; }
-        this.isTicking = true;
+        if (this.activeTicker !== 'none' || this.taskQueue.size === 0) { return; }
 
         if (this.runInBackground && typeof document !== 'undefined' && document.hidden) {
+            this.activeTicker = 'interval';
             if (this.loggingEnabled) {
                 console.log(`--- TimeoutScheduler: Starting in background mode (setInterval @ ${BACKGROUND_TICK_INTERVAL_MS}ms). ---`);
             }
-            this.backgroundTickerId = window.setInterval(this.tick, BACKGROUND_TICK_INTERVAL_MS);
-        } else {
+            this.backgroundTickerId = window.setInterval(this.animationFrameTick, BACKGROUND_TICK_INTERVAL_MS);
+            return;
+        }
+
+        const hasUserVisibleTasks = Array.from(this.taskQueue.values()).some(t => t.priority === 'user-visible');
+
+        if (hasUserVisibleTasks) {
+            this.activeTicker = 'rAF';
             if (this.loggingEnabled) {
-                console.log('--- TimeoutScheduler: Starting in foreground mode (requestAnimationFrame). ---');
+                console.log(`--- TimeoutScheduler: Starting in foreground mode (requestAnimationFrame). Budget: ${this.currentTasksPerFrame} tasks/frame.`);
             }
-            this.animationFrameId = window.requestAnimationFrame(this.tick);
+            this.animationFrameId = window.requestAnimationFrame(this.animationFrameTick);
+        } else {
+            this.activeTicker = 'rIC';
+            if (this.loggingEnabled) {
+                console.log('--- TimeoutScheduler: Only background tasks remain. Starting idle callback ticker. ---');
+            }
+            if (typeof window.requestIdleCallback === 'function') {
+                this.idleCallbackId = window.requestIdleCallback(this.idleTick);
+            } else {
+                // Fallback to rAF if requestIdleCallback is not supported.
+                this.animationFrameId = window.requestAnimationFrame(this.animationFrameTick);
+            }
         }
     }
 
     /**
-     * Stops all running tickers.
+     * @internal Stops all active tickers.
      */
     private stopTicker(): void {
-        if (!this.isTicking) { return; }
+        if (this.animationFrameId) window.cancelAnimationFrame(this.animationFrameId);
+        if (this.idleCallbackId && typeof window.cancelIdleCallback === 'function') window.cancelIdleCallback(this.idleCallbackId);
+        if (this.backgroundTickerId !== null) window.clearInterval(this.backgroundTickerId);
 
-        window.cancelAnimationFrame(this.animationFrameId);
-
-        if (this.backgroundTickerId !== null) {
-            window.clearInterval(this.backgroundTickerId);
-            this.backgroundTickerId = null;
+        this.animationFrameId = 0;
+        this.idleCallbackId = 0;
+        this.backgroundTickerId = null;
+        if (this.activeTicker !== 'none') {
+            this.activeTicker = 'none';
+            if (this.loggingEnabled) console.log('--- TimeoutScheduler: Ticker stopped. ---');
         }
-
-        if (this.loggingEnabled) {
-            console.log('--- TimeoutScheduler: Ticker stopped. ---');
-        }
-        this.isTicking = false;
     }
 
     /**
-     * The main processing loop, executed by either ticker. It processes due tasks
-     * from the queue while respecting the frame budget.
+     * @internal The tick function for `requestAnimationFrame`, which calls the main queue processor.
      */
-    private tick = (): void => {
-        // In rAF mode, the loop stops itself. In setInterval mode, we must guard.
-        if (!this.isTicking) { return; }
+    private animationFrameTick = (): void => this.processQueue();
 
-        const now = Date.now();
+    /**
+     * @internal The tick function for `requestIdleCallback`, which calls the main queue processor.
+     */
+    private idleTick = (deadline: IdleDeadline): void => this.processQueue(deadline);
+
+    /**
+     * @internal The main processing loop that executes tasks from the queue based on
+     * priority and the available time budget.
+     * @param deadline Optional IdleDeadline object provided by `requestIdleCallback`.
+     */
+    private processQueue = (deadline?: IdleDeadline): void => {
+        const isIdleTick = !!deadline;
+        const frameStart = performance.now();
+        const timeBudget = isIdleTick ? deadline.timeRemaining() : this.frameTimeBudgetMs;
         let tasksExecutedThisFrame = 0;
 
-        for (const task of this.taskQueue.values()) {
-            if (tasksExecutedThisFrame >= this.tasksPerFrameBudget) { break; }
-            if (task.executeAt <= now) {
-                try {
-                    task.callback(...task.args);
-                } catch (e) {
-                    console.error('Error executing scheduled callback:', e, task);
-                }
-                this.taskQueue.delete(task.id);
-                tasksExecutedThisFrame++;
-            }
+        const dueTasks = Array.from(this.taskQueue.values()).filter(task => task.executeAt <= frameStart);
+        const highPriorityTasks = dueTasks.filter(t => t.priority === 'user-visible');
+        const lowPriorityTasks = dueTasks.filter(t => t.priority === 'background');
+
+        const process = (task: ScheduledTask) => {
+            try { task.callback(...task.args); } catch (e) { console.error('Error executing scheduled callback:', e, task); }
+            this.taskQueue.delete(task.id);
+            tasksExecutedThisFrame++;
+        };
+
+        // Always process high-priority tasks first.
+        for (const task of highPriorityTasks) {
+            if (!isIdleTick && tasksExecutedThisFrame >= this.currentTasksPerFrame) break;
+            process(task);
+        }
+
+        // Process low-priority tasks if there's time/budget left.
+        for (const task of lowPriorityTasks) {
+            const timeElapsed = performance.now() - frameStart;
+            if (timeElapsed >= timeBudget || (!isIdleTick && tasksExecutedThisFrame >= this.currentTasksPerFrame)) break;
+            process(task);
+        }
+
+        if (this.activeTicker === 'rAF') {
+            this.adjustFrameBudget(performance.now() - frameStart);
         }
 
         this.pendingTaskCountSubject.next(this.taskQueue.size);
+        this.scheduleNextTick();
+    }
 
-        // If using rAF, we must request the next frame. setInterval handles this automatically.
-        if (this.taskQueue.size > 0 && this.backgroundTickerId === null) {
-            this.animationFrameId = window.requestAnimationFrame(this.tick);
-        } else if (this.taskQueue.size === 0) {
+    /**
+     * @internal Determines and schedules the next tick, potentially switching ticker
+     * type if the nature of the remaining tasks has changed.
+     */
+    private scheduleNextTick(): void {
+        if (this.taskQueue.size === 0) {
             this.stopTicker();
+            return;
+        }
+        if (this.activeTicker === 'interval') return; // setInterval handles its own loop
+
+        const hasUserVisibleTasks = Array.from(this.taskQueue.values()).some(t => t.priority === 'user-visible');
+
+        if (hasUserVisibleTasks) {
+            if (this.activeTicker !== 'rAF') {
+                this.stopTicker();
+                this.startTicker();
+            } else {
+                this.animationFrameId = window.requestAnimationFrame(this.animationFrameTick);
+            }
+        } else {
+            if (this.activeTicker !== 'rIC') {
+                if (this.loggingEnabled) console.log('--- TimeoutScheduler: Switching to idle callback mode for background tasks. ---');
+                this.stopTicker();
+                this.startTicker();
+            } else if (typeof window.requestIdleCallback === 'function') {
+                this.idleCallbackId = window.requestIdleCallback(this.idleTick);
+            } else {
+                this.animationFrameId = window.requestAnimationFrame(this.animationFrameTick);
+            }
         }
     }
 
     /**
-     * A final cleanup method. It ensures original timeout functions are restored
-     * and removes any event listeners to prevent memory leaks.
+     * @internal Adjusts the tasks-per-frame budget for the next frame based on the
+     * performance of the current frame.
+     * @param frameDurationMs The time taken to execute tasks in the last frame.
+     */
+    private adjustFrameBudget(frameDurationMs: number): void {
+        if (!this.dynamicBudgetEnabled) return;
+        if (frameDurationMs > this.frameTimeBudgetMs && this.currentTasksPerFrame > 1) {
+            const newBudget = Math.max(1, Math.floor(this.currentTasksPerFrame * 0.9));
+            if (this.loggingEnabled) console.log(`--- Frame time exceeded budget (${frameDurationMs.toFixed(2)}ms). Reducing budget to ${newBudget}. ---`);
+            this.currentTasksPerFrame = newBudget;
+        } else if (frameDurationMs < this.frameTimeBudgetMs && this.currentTasksPerFrame < this.maxTasksPerFrame) {
+            this.currentTasksPerFrame = Math.min(this.maxTasksPerFrame, this.currentTasksPerFrame + 1);
+        }
+    }
+
+    /**
+     * A final cleanup method. It ensures original timeout functions are restored,
+     * removes any event listeners, and completes observables to prevent memory leaks.
      */
     public destroy(): void {
         if (this.runInBackground && typeof document !== 'undefined') {
@@ -235,28 +384,13 @@ export class TimeoutScheduler {
     }
 
     /**
-     * Handles the 'visibilitychange' event to switch tickers for optimal performance.
+     * @internal Handles the 'visibilitychange' event to switch tickers for optimal
+     * performance, pausing rAF when the tab is hidden.
      */
     private handleVisibilityChange = () => {
-        if (!this.isTicking) { return; }
-
-        if (document.hidden) {
-            // PAGE IS NOW HIDDEN: Switch from smooth rAF to reliable setInterval.
-            if (this.loggingEnabled) {
-                console.warn('--- TimeoutScheduler: Tab hidden. Switching to setInterval ticker. ---');
-            }
-            window.cancelAnimationFrame(this.animationFrameId);
-            this.backgroundTickerId = window.setInterval(this.tick, BACKGROUND_TICK_INTERVAL_MS);
-        } else {
-            // PAGE IS NOW VISIBLE: Switch back from setInterval to smooth rAF.
-            if (this.loggingEnabled) {
-                console.warn('--- TimeoutScheduler: Tab visible. Switching back to requestAnimationFrame ticker. ---');
-            }
-            if (this.backgroundTickerId !== null) {
-                window.clearInterval(this.backgroundTickerId);
-                this.backgroundTickerId = null;
-            }
-            this.animationFrameId = window.requestAnimationFrame(this.tick);
+        this.stopTicker();
+        if (this.taskQueue.size > 0) {
+            this.startTicker();
         }
     };
 }
