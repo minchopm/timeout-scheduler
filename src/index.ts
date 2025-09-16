@@ -225,9 +225,9 @@ export class TimeoutScheduler {
         if (this.runInBackground && typeof document !== 'undefined' && document.hidden) {
             this.activeTicker = 'interval';
             if (this.loggingEnabled) {
-                console.log(`--- TimeoutScheduler: Starting in background mode (setInterval @ ${BACKGROUND_TICK_INTERVAL_MS}ms). ---`);
+                console.log(`--- TimeoutScheduler: Page is hidden. Starting in background mode (setInterval @ ${BACKGROUND_TICK_INTERVAL_MS}ms). ---`);
             }
-            this.backgroundTickerId = window.setInterval(this.animationFrameTick, BACKGROUND_TICK_INTERVAL_MS);
+            this.backgroundTickerId = this.originalSetTimeout(this.animationFrameTick, BACKGROUND_TICK_INTERVAL_MS);
             return;
         }
 
