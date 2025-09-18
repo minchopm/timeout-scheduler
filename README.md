@@ -3,7 +3,7 @@
 [![NPM Version](https://img.shields.io/npm/v/@artesoft/timeout-scheduler.svg)](https://www.npmjs.com/package/@artesoft/timeout-scheduler)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A performance-oriented, "freeze-proof" scheduler that provides a priority-based task system to prevent UI blocking. It intelligently uses `requestAnimationFrame` for high-priority tasks and `requestIdleCallback` for non-essential background work.
+An advanced, "freeze-proof" scheduler that puts you in control of performance. It intelligently switches between `requestAnimationFrame`, the modern `scheduler.postTask` API, and `setTimeout` fallbacks to prevent UI blocking. Choose a strategy to prioritize raw throughput or UI responsiveness, and let the scheduler handle the rest.
 
 ---
 
@@ -13,20 +13,23 @@ Complex web applications can fire hundreds of `setTimeout` calls, blocking the b
 
 ### The Solution
 
-`@artesoft/timeout-scheduler` solves this by intercepting `setTimeout` and providing a priority-aware task queue.
+`@artesoft/timeout-scheduler` solves this by intercepting `setTimeout` calls and managing them through a powerful, configurable scheduling engine. It introduces a strategy-based approach to performance:
 
--   **High-priority tasks** (e.g., UI updates) are processed smoothly using `requestAnimationFrame`, ensuring your application remains responsive.
--   **Low-priority tasks** (e.g., logging, non-essential data processing) are deferred to `requestIdleCallback`, allowing the browser to execute them during periods of inactivity, guaranteeing zero impact on performance.
+-   **`'throughput'` Strategy (Default):** For maximum raw speed, it uses a highly-optimized `requestAnimationFrame` loop to process tasks when the tab is active. This is ideal for applications running a high volume of small, fast-repeating tasks.
+-   **`'responsiveness'` Strategy:** For guaranteed UI smoothness, it leverages the modern `scheduler.postTask` API whenever available. This cooperative scheduler ensures that long-running tasks yield to the browser, preventing user input from being blocked.
+
+In both strategies, the scheduler intelligently switches to the most efficient background-processing method when the tab is hidden, ensuring tasks are completed without wasting resources.
 
 ## Features
 
--   **Prevents UI Freezing:** Batches `setTimeout` callbacks to run smoothly over time.
--   **🚀 Cooperative Scheduling:** Uses `requestIdleCallback` for low-priority tasks to run work only when the browser is idle.
--   **Task Prioritization:** A new `scheduleTask` API lets you distinguish between `'user-visible'` and `'background'` work.
--   **Dynamic Performance Tuning:** Automatically adjusts how many tasks run per frame based on main thread performance.
+-   **✅ Prevents UI Freezing:** Batches `setTimeout` callbacks to run smoothly over time.
+-   **🚀 Configurable Scheduling Strategy:** Choose between `'throughput'` (default) for speed or `'responsiveness'` for a guaranteed non-blocking UI.
+-   **Modern API Integration:** Uses `scheduler.postTask` for best-in-class cooperative scheduling in `'responsiveness'` mode or in the background.
+-   **Intelligent Background Handling:** Automatically switches to the most efficient strategy (`scheduler.postTask` or `setTimeout`) when the tab is not visible.
+-   **Dynamic Performance Tuning:** In `rAF` mode, automatically adjusts how many tasks run per frame based on main thread performance.
 -   **Drop-in Replacement:** The `overrideTimeouts()` method works without refactoring your existing `setTimeout` calls.
 -   **Graceful Shutdown:** Pending tasks are never lost and are rescheduled with native `setTimeout` on cleanup.
--   **Highly Configurable:** Fine-tune the scheduling behavior, enable dynamic budgeting, and turn on logging.
+-   **Highly Configurable:** Fine-tune `rAF` behavior, enable dynamic budgeting, and turn on logging.
 -   **Framework-Agnostic:** Works with any frontend framework or vanilla JavaScript.
 
 ## Installation
@@ -37,36 +40,60 @@ npm install @artesoft/timeout-scheduler rxjs
 
 ## How to Use
 
-### Basic Usage (Drop-in)
+### Basic Usage (Drop-in with Default Strategy)
 
-For instant benefits, simply initialize the scheduler and override the global `setTimeout`. All existing calls will be treated as high-priority and managed smoothly.
+For instant benefits, initialize the scheduler and override the global `setTimeout`. This will use the default `'throughput'` strategy, prioritizing raw speed when the tab is visible.
 
 ```typescript
 import { TimeoutScheduler } from '@artesoft/timeout-scheduler';
 
+// No strategy is specified, so it defaults to 'throughput' (rAF-first).
 const scheduler = new TimeoutScheduler({ loggingEnabled: true });
 scheduler.overrideTimeouts();
 
 // This is now managed by the scheduler and won't block the UI.
-setTimeout(() => console.log('This is a user-visible task!'), 100);```
+setTimeout(() => console.log('This is a high-throughput task!'), 100);
+```
 
-### Advanced Usage with Task Priorities
+### Advanced Usage (Choosing the 'Responsiveness' Strategy)
 
-Use the `scheduleTask` method to leverage the full power of cooperative scheduling.
+If your application has complex UI updates or long-running tasks where smoothness is the top priority, choose the `'responsiveness'` strategy.
 
 ```typescript
 import { TimeoutScheduler } from '@artesoft/timeout-scheduler';
 
-const scheduler = new TimeoutScheduler({ loggingEnabled: true });
+// Explicitly choose the 'responsiveness' strategy to use scheduler.postTask
+const scheduler = new TimeoutScheduler({
+  primaryStrategy: 'responsiveness',
+  loggingEnabled: true
+});
+
+scheduler.overrideTimeouts();
+
+// This task will be scheduled with scheduler.postTask, guaranteeing
+// that it won't freeze the page, even if it takes a long time.
+setTimeout(() => {
+  console.log('This task will not block the UI!');
+}, 200);
+```
+
+### Advanced Usage with Task Priorities
+
+The `scheduleTask` method gives you fine-grained control, which is especially powerful in the `rAF`-based `'throughput'` mode.
+
+```typescript
+import { TimeoutScheduler } from '@artesoft/timeout-scheduler';
+
+const scheduler = new TimeoutScheduler(); // Default 'throughput' strategy
 
 // High-priority task: Renders an important UI element.
-// Will use requestAnimationFrame.
+// In 'throughput' mode, this is prioritized within the rAF loop.
 scheduler.scheduleTask(() => {
   document.getElementById('root').innerHTML = 'UI Updated!';
 }, { delay: 100, priority: 'user-visible' });
 
 // Low-priority task: Send analytics data.
-// Will use requestIdleCallback and only run when the browser is idle.
+// In 'throughput' mode, this will only run if there's spare time in the frame budget.
 scheduler.scheduleTask(() => {
   fetch('/api/analytics', { method: 'POST', body: '{}' });
 }, { delay: 500, priority: 'background' });
@@ -94,12 +121,12 @@ Give your productivity a boost and take control of your schedule. **[Check out C
 
 Creates a new scheduler instance.
 - `config` (optional): `SchedulerConfig` object.
-  - `initialTasksPerFrame?: number` (Default: `50`)
+  - `primaryStrategy?: 'throughput' | 'responsiveness'` (Default: `'throughput'`)
   - `loggingEnabled?: boolean` (Default: `false`)
-  - `runInBackground?: boolean` (Default: `false`)
-  - `dynamicBudgetEnabled?: boolean` (Default: `true`)
-  - `frameTimeBudgetMs?: number` (Default: `8`)
-  - `maxTasksPerFrame?: number` (Default: `150`)
+  - `dynamicBudgetEnabled?: boolean` (Default: `true`) — *(rAF Mode)*
+  - `initialTasksPerFrame?: number` (Default: `50`) — *(rAF Mode)*
+  - `frameTimeBudgetMs?: number` (Default: `8`) — *(rAF Mode)*
+  - `maxTasksPerFrame?: number` (Default: `150`) — *(rAF Mode)*
 
 ### `.scheduleTask(callback, options?)`
 
@@ -111,7 +138,7 @@ Schedules a task with a given priority. This is the preferred API for new code.
 
 ### `.overrideTimeouts()`
 
-Replaces `window.setTimeout` and `window.clearTimeout`. All tasks scheduled via this method are assigned `'user-visible'` priority.
+Replaces `window.setTimeout` and `window.clearTimeout`. Tasks are managed according to the chosen `primaryStrategy`.
 
 ### `.restoreTimeouts()`
 
@@ -119,7 +146,7 @@ Restores the original `window.setTimeout` and `window.clearTimeout` functions an
 
 ### `.destroy()`
 
-A complete cleanup method. It calls `restoreTimeouts()` and completes observables to prevent memory leaks.
+A complete cleanup method. It calls `restoreTimeouts()`, removes event listeners, and completes observables to prevent memory leaks.
 
 ### `pendingTaskCount$`
 
