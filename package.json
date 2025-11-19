@@ -1,6 +1,6 @@
 {
   "name": "@artesoft/timeout-scheduler",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "A performance-oriented, freeze-proof scheduler that provides a priority-based task system to prevent UI blocking.",
   "main": "./dist/cjs/index.js",
   "module": "./dist/esm/index.js",

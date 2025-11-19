@@ -1,14 +1,11 @@
 import { BehaviorSubject, Observable } from 'rxjs';
 
 /**
- * Defines the execution strategy for the scheduler, allowing users to prioritize
- * either raw processing speed or UI smoothness.
+ * Defines the execution strategy for the scheduler.
  * - `throughput` (Default): Prioritizes maximum task execution speed by using
- *   `requestAnimationFrame` when the page is visible. This is ideal for running
- *   a high volume of small, fast tasks.
- * - `responsiveness`: Prioritizes keeping the UI smooth and interactive by using
- *   `scheduler.postTask` whenever available. This is safer for tasks that might
- *   be long-running, as it prevents blocking the main thread.
+ *   `requestAnimationFrame`. Ideal for UI animations and high-frequency updates.
+ * - `responsiveness`: Prioritizes main-thread responsiveness by using
+ *   `scheduler.postTask` (if available) to yield frequently.
  */
 export type SchedulingStrategy = 'throughput' | 'responsiveness';
 
@@ -20,58 +17,82 @@ export type SchedulingStrategy = 'throughput' | 'responsiveness';
 export type TaskPriority = 'user-visible' | 'background';
 
 /**
- * Defines the options for scheduling a task with priority.
+ * Options for scheduling a specific task.
  */
 export interface TaskOptions {
     /** The delay in milliseconds before the task should be executed. */
     delay?: number;
-    /** The priority of the task, affecting its execution order. */
+    /** The priority of the task within the batching queue. */
     priority?: TaskPriority;
+    /**
+     * Determines if the task should be batched and throttled by the scheduler.
+     * - `true` (Default): The task is added to the frame loop and executed according
+     *   to the time budget. This is best for UI performance.
+     * - `false`: The task bypasses the frame loop and uses a dedicated native timer.
+     *   This is required for networking libraries (e.g., Socket.io) that need exact timing
+     *   and cannot tolerate background throttling.
+     */
+    batching?: boolean;
 }
 
 /**
- * Defines the configuration options for the scheduler.
+ * Global configuration for the TimeoutScheduler instance.
  */
 export interface SchedulerConfig {
     /**
-     * The primary scheduling strategy to use. Defaults to 'throughput'.
+     * The primary scheduling strategy to use when the page is visible.
      * @default 'throughput'
      */
     primaryStrategy?: SchedulingStrategy;
+    /**
+     * If true, logs internal state changes to the console.
+     * @default false
+     */
+    loggingEnabled?: boolean;
+    /**
+     * (rAF Mode) If true, automatically adjusts the number of tasks per frame based on execution time.
+     * @default true
+     */
+    dynamicBudgetEnabled?: boolean;
+    /**
+     * (rAF Mode) The target execution time per frame in milliseconds.
+     * @default 8
+     */
+    frameTimeBudgetMs?: number;
     /**
      * (rAF Mode) The initial number of tasks to execute per frame.
      * @default 50
      */
     initialTasksPerFrame?: number;
     /**
-     * If true, logs strategy changes and performance adjustments to the console.
-     * @default false
-     */
-    loggingEnabled?: boolean;
-    /**
-     * (rAF Mode) If true, enables dynamic adjustment of the tasks-per-frame budget.
-     * @default true
-     */
-    dynamicBudgetEnabled?: boolean;
-    /**
-     * (rAF Mode) The target frame processing time in milliseconds.
-     * @default 8
-     */
-    frameTimeBudgetMs?: number;
-    /**
-     * @deprecated This property is no longer used and has no effect. Background
-     * execution is now handled automatically and is always enabled.
-     */
-    runInBackground?: boolean;
-    /**
-     * (rAF Mode) The maximum number of tasks to execute in a single frame.
+     * (rAF Mode) The maximum number of tasks allowed per frame.
      * @default 150
      */
     maxTasksPerFrame?: number;
+    /**
+     * The interval (in ms) for the background ticker when the tab is hidden.
+     * Higher values reduce CPU usage; lower values improve background responsiveness.
+     * @default 250
+     */
+    backgroundTickInterval?: number;
 }
 
 /**
- * @internal An internal interface representing a task in the queue.
+ * Configuration for the `overrideTimeouts` method.
+ */
+export interface OverrideOptions {
+    /**
+     * A callback hook that allows you to determine the `TaskOptions` dynamically
+     * whenever `setTimeout` is called.
+     *
+     * Use this to inspect the callback, delay, or arguments (or the Error stack)
+     * to decide if a task should disable batching (e.g., for Socket.io).
+     */
+    getTaskOptions?: (callback: Function, delay: number, args: any[]) => TaskOptions;
+}
+
+/**
+ * @internal Internal representation of a scheduled task.
  */
 interface ScheduledTask {
     id: number;
@@ -79,20 +100,18 @@ interface ScheduledTask {
     executeAt: number;
     args: any[];
     priority: TaskPriority;
-    postTaskController?: AbortController; // Used for cancellation in postTask mode
+    batching: boolean;
+    /** If batching is false, this holds the ID of the native browser timer. */
+    nativeTimerId?: number;
+    /** Used for cancellation if the task is scheduled via scheduler.postTask. */
+    postTaskController?: AbortController;
 }
 
 /**
- * @internal The interval (in ms) for the least-performant background ticker.
- */
-const BACKGROUND_TICK_INTERVAL_MS = 250;
-
-/**
- * A highly configurable, performance-oriented scheduler. It allows developers to
- * choose between a 'throughput'-first strategy (using requestAnimationFrame for
- * maximum speed) or a 'responsiveness'-first strategy (using scheduler.postTask
- * to ensure a non-blocking UI). It intelligently handles background execution
- * and provides robust fallbacks for older browsers.
+ * A highly configurable, performance-oriented scheduler.
+ * It intercepts or manages timer tasks to optimize main-thread usage,
+ * providing frame-budgeting for UI work while allowing critical networking
+ * tasks to bypass throttling.
  */
 export class TimeoutScheduler {
     // --- Configuration ---
@@ -102,6 +121,7 @@ export class TimeoutScheduler {
     private readonly frameTimeBudgetMs: number;
     private readonly maxTasksPerFrame: number;
     private readonly initialTasksPerFrame: number;
+    private readonly backgroundTickInterval: number;
 
     // --- Native Functions ---
     private readonly originalSetTimeout = window.setTimeout;
@@ -122,13 +142,13 @@ export class TimeoutScheduler {
     private backgroundTickerId: number | null = null;
 
     // --- Public Observables ---
-    /** An RxJS Observable that emits the current number of tasks pending in the queue. */
+    /** Emits the current number of pending tasks (both batched and non-batched). */
     public readonly pendingTaskCount$: Observable<number>;
     private readonly pendingTaskCountSubject = new BehaviorSubject<number>(0);
 
     /**
      * Constructs an instance of the TimeoutScheduler.
-     * @param config Optional configuration to customize the scheduler's behavior.
+     * @param config Configuration options.
      */
     constructor(config?: SchedulerConfig) {
         this.pendingTaskCount$ = this.pendingTaskCountSubject.asObservable();
@@ -139,40 +159,69 @@ export class TimeoutScheduler {
         this.frameTimeBudgetMs = config?.frameTimeBudgetMs ?? 8;
         this.initialTasksPerFrame = config?.initialTasksPerFrame ?? 50;
         this.maxTasksPerFrame = config?.maxTasksPerFrame ?? 150;
+        this.backgroundTickInterval = config?.backgroundTickInterval ?? 250;
         this.currentTasksPerFrame = this.initialTasksPerFrame;
 
         if (typeof window === 'undefined' || !window.performance) {
             throw new Error('TimeoutScheduler requires a browser environment with performance API support.');
         }
 
-        this.isPostTaskSupported = typeof window !== 'undefined' && 'scheduler' in window && typeof (window as any).scheduler.postTask === 'function';
+        // Check for native scheduler.postTask support
+        this.isPostTaskSupported = typeof window !== 'undefined' &&
+            'scheduler' in window &&
+            typeof (window as any).scheduler.postTask === 'function';
 
         if (typeof document !== 'undefined') {
             document.addEventListener('visibilitychange', this.handleVisibilityChange);
+            // Initialize state based on current visibility
             this.handleVisibilityChange();
         }
     }
 
     /**
-     * Schedules a task with a specific priority.
+     * Schedules a task.
      * @param callback The function to execute.
-     * @param options The scheduling options, including delay and priority.
-     * @returns The ID of the scheduled task, which can be used for cancellation.
+     * @param options Configuration for delay, priority, and batching behavior.
+     * @returns A unique Task ID (compatible with clearTimeout).
      */
     public scheduleTask(callback: (...args: any[]) => void, options?: TaskOptions): number {
         const taskId = ++this.taskIdCounter;
         const priority = options?.priority ?? 'user-visible';
+        const useBatching = options?.batching ?? true;
 
         const delay = Number(options?.delay) || 0;
         const executeAt = performance.now() + delay;
 
-        const task: ScheduledTask = { id: taskId, callback, executeAt, args: [], priority };
+        const task: ScheduledTask = {
+            id: taskId,
+            callback,
+            executeAt,
+            args: [],
+            priority,
+            batching: useBatching
+        };
+
         this.taskQueue.set(taskId, task);
         this.pendingTaskCountSubject.next(this.taskQueue.size);
 
+        // BRANCH 1: Non-Batched (Exact Timing)
+        // If batching is disabled, we schedule a dedicated native timer immediately.
+        // This bypasses the frame loop and background throttling.
+        if (!useBatching) {
+            // Casting to unknown then number ensures compatibility if Node types are present
+            task.nativeTimerId = this.originalSetTimeout.call(window, () => {
+                this.executeTaskImmediately(taskId);
+            }, delay) as unknown as number;
+
+            return taskId;
+        }
+
+        // BRANCH 2: Batched (Frame Budgeted)
+        // If the scheduler is idle, kickstart the loop.
         if (this.currentSchedulingMode === 'idle' && this.taskQueue.size > 0) {
             this.startAppropriateTicker();
         } else if (this.currentSchedulingMode === 'postTask') {
+            // In postTask mode, we schedule individually via the API
             this.runTaskWithPostTask(task);
         }
 
@@ -180,51 +229,78 @@ export class TimeoutScheduler {
     }
 
     /**
-     * Cancels a previously scheduled task.
-     * @param taskId The ID of the task to cancel.
+     * Cancels a scheduled task, whether it is batched or non-batched.
+     * @param taskId The ID returned by scheduleTask.
      */
     public cancelTask(taskId: number): void {
         const task = this.taskQueue.get(taskId);
         if (task) {
+            // Cleanup non-batched native timer
+            if (task.nativeTimerId !== undefined) {
+                this.originalClearTimeout.call(window, task.nativeTimerId);
+            }
+            // Cleanup postTask controller
             if (task.postTaskController) {
                 task.postTaskController.abort();
             }
+
             this.taskQueue.delete(taskId);
             this.pendingTaskCountSubject.next(this.taskQueue.size);
         }
     }
 
     /**
-     * Overrides the global `window.setTimeout` and `window.clearTimeout` functions.
-     * All tasks scheduled via `setTimeout` will be managed by this scheduler.
+     * Overrides the global `window.setTimeout` and `window.clearTimeout`.
+     * Allows providing a hook to dynamically configure task options (e.g., disabling batching).
+     * @param options Configuration for the override behavior.
      */
-    public overrideTimeouts(): void {
+    public overrideTimeouts(options?: OverrideOptions): void {
         if (this.isOverridden) return;
         if (this.loggingEnabled) console.warn(`--- TimeoutScheduler (${this.primaryStrategy}): OVERRIDING global setTimeout. ---`);
         this.isOverridden = true;
 
-        window.setTimeout = ((callback: (...args: any[]) => void, delay?: number, ...args: any[]): number => {
-            return this.scheduleTask(callback.bind(null, ...args), { delay });
-        }) as any;
+        // Ensure the default return is cast to TaskOptions to avoid TS errors on property assignment
+        const getOptions = options?.getTaskOptions || (() => ({ batching: true } as TaskOptions));
 
-        window.clearTimeout = ((timeoutId?: number): void => {
+        // @ts-ignore
+        window.setTimeout = (callback: (...args: any[]) => void, delay?: number, ...args: any[]): number => {
+            const delayMs = Number(delay) || 0;
+
+            // Dynamically determine options (e.g. check stack trace for Socket.io)
+            const taskOptions = getOptions(callback, delayMs, args);
+
+            // Ensure delay is carried over
+            taskOptions.delay = delayMs;
+
+            return this.scheduleTask(callback.bind(null, ...args), taskOptions);
+        };
+
+        // @ts-ignore
+        window.clearTimeout = (timeoutId?: number): void => {
             if (timeoutId !== undefined) this.cancelTask(timeoutId);
-        }) as any;
+        };
     }
 
     /**
-     * Restores the original `window.setTimeout` and `window.clearTimeout` functions.
-     * Any pending tasks are gracefully rescheduled using the native `setTimeout`.
+     * Restores the original `window.setTimeout` and `window.clearTimeout`.
+     * Any pending batched tasks are rescheduled to run natively.
      */
     public restoreTimeouts(): void {
         if (!this.isOverridden) return;
         this.stopAllTickers();
-        if (this.loggingEnabled) console.warn(`--- TimeoutScheduler (${this.primaryStrategy}): Restoring original functions and rescheduling tasks. ---`);
+
+        // Cancel any active non-batched native timers to avoid duplicates
+        this.taskQueue.forEach(task => {
+            if (task.nativeTimerId) this.originalClearTimeout(task.nativeTimerId);
+        });
+
+        if (this.loggingEnabled) console.warn(`--- TimeoutScheduler: Restoring original functions. ---`);
 
         window.setTimeout = this.originalSetTimeout as any;
         window.clearTimeout = this.originalClearTimeout;
         this.isOverridden = false;
 
+        // Reschedule all pending tasks using the native browser function
         const now = performance.now();
         for (const task of this.taskQueue.values()) {
             const remainingDelay = Math.max(0, task.executeAt - now);
@@ -235,8 +311,7 @@ export class TimeoutScheduler {
     }
 
     /**
-     * A final cleanup method. Restores timeouts, removes event listeners, and
-     * completes observables to prevent memory leaks.
+     * Destroys the scheduler instance, removing listeners and restoring globals.
      */
     public destroy(): void {
         if (typeof document !== 'undefined') {
@@ -246,8 +321,12 @@ export class TimeoutScheduler {
         this.pendingTaskCountSubject.complete();
     }
 
+    // =========================================
+    // Internal Logic
+    // =========================================
+
     /**
-     * @internal Handles the 'visibilitychange' event to switch scheduling strategies.
+     * Handles visibility changes to switch between rAF (high perf) and setTimeout (background).
      */
     private handleVisibilityChange = () => {
         this.stopAllTickers();
@@ -255,47 +334,74 @@ export class TimeoutScheduler {
     };
 
     /**
-     * @internal Determines and starts the best scheduling ticker based on the
-     * current strategy, page visibility, and browser support.
+     * Helper to execute a non-batched task immediately and remove it from the queue.
+     */
+    private executeTaskImmediately(taskId: number) {
+        const task = this.taskQueue.get(taskId);
+        if (!task) return;
+
+        try {
+            task.callback(...task.args);
+        } catch (e) {
+            console.error('Error executing non-batched callback:', e, task);
+        } finally {
+            this.taskQueue.delete(taskId);
+            this.pendingTaskCountSubject.next(this.taskQueue.size);
+        }
+    }
+
+    /**
+     * Determines the correct scheduling loop based on tasks, strategy, and visibility.
      */
     private startAppropriateTicker() {
-        if (this.taskQueue.size === 0) {
+        // We only need a ticker loop for tasks that require batching.
+        const hasBatchedTasks = Array.from(this.taskQueue.values()).some(t => t.batching);
+        if (!hasBatchedTasks) {
             this.currentSchedulingMode = 'idle';
             return;
         }
 
         const isHidden = typeof document !== 'undefined' && document.hidden;
         const log = (mode: string) => {
-            if (this.loggingEnabled) console.log(`--- TimeoutScheduler (${this.primaryStrategy}): Tab is ${isHidden ? 'hidden' : 'visible'}. Activating '${mode}' mode.`);
+            if (this.loggingEnabled) console.log(`--- TimeoutScheduler: Tab is ${isHidden ? 'hidden' : 'visible'}. Activating '${mode}' mode.`);
         };
 
+        // 1. Responsiveness Strategy (User Preference)
         if (this.primaryStrategy === 'responsiveness' && this.isPostTaskSupported) {
             log('postTask');
             this.currentSchedulingMode = 'postTask';
-            this.taskQueue.forEach(this.runTaskWithPostTask);
+            this.taskQueue.forEach(t => { if(t.batching) this.runTaskWithPostTask(t); });
             return;
         }
 
+        // 2. Visible Tab (Throughput Strategy)
         if (!isHidden) {
             log('rAF');
             this.currentSchedulingMode = 'rAF';
             this.animationFrameId = window.requestAnimationFrame(this.processRafQueue);
-        } else {
+        }
+        // 3. Hidden Tab (Background)
+        else {
             if (this.isPostTaskSupported) {
+                // postTask is often throttled less aggressively than setTimeout in background
                 log('postTask');
                 this.currentSchedulingMode = 'postTask';
-                this.taskQueue.forEach(this.runTaskWithPostTask);
+                this.taskQueue.forEach(t => { if(t.batching) this.runTaskWithPostTask(t); });
             } else {
+                // Standard fallback to throttled setTimeout loop
                 log('timeout');
                 this.currentSchedulingMode = 'timeout';
-                this.backgroundTickerId = this.originalSetTimeout(this.processRafQueue, BACKGROUND_TICK_INTERVAL_MS);
+                // Cast to number here as well to handle Node type environments
+                this.backgroundTickerId = this.originalSetTimeout.call(window,
+                    this.processRafQueue,
+                    this.backgroundTickInterval // Uses the configurable interval
+                ) as unknown as number;
             }
         }
     }
 
     /**
-     * @internal Stops all active tickers and aborts any in-flight postTask controllers.
-     * This is a "heavy" operation for major state changes like hiding the tab.
+     * Stops all active loops (rAF, timeout) and aborts postTask controllers.
      */
     private stopAllTickers() {
         if (this.animationFrameId) window.cancelAnimationFrame(this.animationFrameId);
@@ -304,6 +410,7 @@ export class TimeoutScheduler {
         this.animationFrameId = 0;
         this.backgroundTickerId = null;
 
+        // Abort any in-flight batched postTask executions
         this.taskQueue.forEach(task => {
             if (task.postTaskController && !task.postTaskController.signal.aborted) {
                 task.postTaskController.abort();
@@ -311,43 +418,41 @@ export class TimeoutScheduler {
         });
 
         if (this.loggingEnabled && this.currentSchedulingMode !== 'idle') {
-            console.log(`--- TimeoutScheduler (${this.primaryStrategy}): Stopping '${this.currentSchedulingMode}' ticker.`);
+            console.log(`--- TimeoutScheduler: Stopping '${this.currentSchedulingMode}' ticker.`);
         }
         this.currentSchedulingMode = 'idle';
     }
 
     /**
-     * @internal Schedules and executes a single task using the `scheduler.postTask` API.
+     * Schedules a single batched task using scheduler.postTask.
      */
     private runTaskWithPostTask = (task: ScheduledTask) => {
+        if (!task.batching) return; // Should not happen, but safety check
         if (task.postTaskController && !task.postTaskController.signal.aborted) return;
 
         const controller = new AbortController();
         task.postTaskController = controller;
-        const delay = Math.max(0, task.executeAt - performance.now());
 
         (window as any).scheduler.postTask(() => {
-            try {
-                task.callback(...task.args);
-            } catch (e) {
-                console.error('Error executing postTask callback:', e, task);
-            } finally {
+            // We reuse the immediate execution helper logic
+            this.executeTaskImmediately(task.id);
+        }, {
+            signal: controller.signal,
+            delay: Math.max(0, task.executeAt - performance.now()),
+            priority: task.priority === 'user-visible' ? 'user-visible' : 'background'
+        }).catch((err: any) => {
+            // Ignore AbortErrors, log others
+            if (err.name !== 'AbortError') {
+                console.error('Error in scheduler.postTask:', err);
                 this.taskQueue.delete(task.id);
                 this.pendingTaskCountSubject.next(this.taskQueue.size);
-            }
-        }).catch((err: any) => {
-            if (err.name !== 'AbortError') {
-                console.error('An unexpected error occurred in scheduler.postTask:', err);
-                if (this.taskQueue.has(task.id)) {
-                    this.taskQueue.delete(task.id);
-                    this.pendingTaskCountSubject.next(this.taskQueue.size);
-                }
             }
         });
     }
 
     /**
-     * @internal The main processing loop for `requestAnimationFrame` and `setTimeout` modes.
+     * The main processing loop used by `rAF` and `timeout` modes.
+     * Batches tasks and respects the frame budget.
      */
     private processRafQueue = (): void => {
         if (this.currentSchedulingMode !== 'rAF' && this.currentSchedulingMode !== 'timeout') {
@@ -357,52 +462,69 @@ export class TimeoutScheduler {
         const frameStart = performance.now();
         let tasksExecutedThisFrame = 0;
 
-        const dueTasks = Array.from(this.taskQueue.values()).filter(task => task.executeAt <= frameStart);
+        // 1. Identify Tasks: Only process batched tasks that are due
+        const dueTasks = Array.from(this.taskQueue.values())
+            .filter(task => task.batching && task.executeAt <= frameStart);
+
         const highPriorityTasks = dueTasks.filter(t => t.priority === 'user-visible');
         const lowPriorityTasks = dueTasks.filter(t => t.priority === 'background');
 
+        // Helper to execute and delete
         const process = (task: ScheduledTask) => {
-            try { task.callback(...task.args); } catch (e) { console.error('Error executing scheduled callback:', e, task); }
+            try { task.callback(...task.args); } catch (e) { console.error('Error executing scheduled callback:', e); }
             this.taskQueue.delete(task.id);
             tasksExecutedThisFrame++;
         };
 
+        // 2. Execute High Priority (User Visible)
         for (const task of highPriorityTasks) {
             if (tasksExecutedThisFrame >= this.currentTasksPerFrame) break;
             process(task);
         }
 
+        // 3. Execute Low Priority (Background) - Only if time permits
         for (const task of lowPriorityTasks) {
             const timeElapsed = performance.now() - frameStart;
             if (timeElapsed >= this.frameTimeBudgetMs || tasksExecutedThisFrame >= this.currentTasksPerFrame) break;
             process(task);
         }
 
+        // 4. Adjust Budget
         this.adjustFrameBudget(performance.now() - frameStart);
         this.pendingTaskCountSubject.next(this.taskQueue.size);
 
-        if (this.currentSchedulingMode === 'rAF') {
-            this.animationFrameId = window.requestAnimationFrame(this.processRafQueue);
-        } else if (this.currentSchedulingMode === 'timeout') {
-            if (this.taskQueue.size > 0) {
-                this.backgroundTickerId = this.originalSetTimeout(this.processRafQueue, BACKGROUND_TICK_INTERVAL_MS);
-            } else {
-                this.currentSchedulingMode = 'idle';
+        // 5. Schedule Next Tick
+        const remainingBatchedTasks = Array.from(this.taskQueue.values()).some(t => t.batching);
+
+        if (remainingBatchedTasks) {
+            if (this.currentSchedulingMode === 'rAF') {
+                this.animationFrameId = window.requestAnimationFrame(this.processRafQueue);
+            } else if (this.currentSchedulingMode === 'timeout') {
+                // Cast to number for Node type compatibility
+                this.backgroundTickerId = this.originalSetTimeout.call(window,
+                    this.processRafQueue,
+                    this.backgroundTickInterval
+                ) as unknown as number;
             }
+        } else {
+            this.currentSchedulingMode = 'idle';
         }
     }
 
     /**
-     * @internal (rAF Mode) Adjusts the tasks-per-frame budget for the next frame.
+     * Adjusts the number of tasks allowed per frame based on how long the previous frame took.
      */
     private adjustFrameBudget(frameDurationMs: number): void {
         if (!this.dynamicBudgetEnabled || this.currentSchedulingMode !== 'rAF') return;
 
+        // If we exceeded budget, reduce task count
         if (frameDurationMs > this.frameTimeBudgetMs && this.currentTasksPerFrame > 1) {
             const newBudget = Math.max(1, Math.floor(this.currentTasksPerFrame * 0.9));
             if (this.loggingEnabled) console.log(`--- Frame budget exceeded (${frameDurationMs.toFixed(2)}ms). Reducing to ${newBudget} tasks/frame.`);
             this.currentTasksPerFrame = newBudget;
-        } else if (frameDurationMs < this.frameTimeBudgetMs && this.currentTasksPerFrame < this.maxTasksPerFrame) {
+        }
+        // If we have plenty of time, increase task count
+        else if (frameDurationMs < this.frameTimeBudgetMs && this.currentTasksPerFrame < this.maxTasksPerFrame) {
             this.currentTasksPerFrame = Math.min(this.maxTasksPerFrame, this.currentTasksPerFrame + 1);
         }
     }
